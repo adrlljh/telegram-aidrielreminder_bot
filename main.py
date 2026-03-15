@@ -121,9 +121,13 @@ def call_gemini(prompt, retries=3):
 def parse_task_with_gemini(text):
     try:
         now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %A")
-        prompt = f"Today is {now}. Extract task info from: '{text}'. Warm assistant named aidriel. Output JSON: {{ 'task': '...', 'deadline': 'YYYY-MM-DD HH:MM', 'priority': 1-5, 'recurrence': '...', 'tag': 'Work|Personal|Errand|Home|General', 'friendly_confirm': 'short conversational confirmation reflecting the vibe' }}"
+        prompt = f"""Today is {now}. Warm assistant aidriel. 
+        Extract task info from: '{text}'. 
+        CRITICAL: Do NOT repeat or summarize the task details in your 'friendly_confirm'. 
+        Give a short, natural acknowledgement ONLY (e.g., "Alright!", "Got it!", "On it!").
+        Output JSON: {{ 'task': '...', 'deadline': 'YYYY-MM-DD HH:MM', 'priority': 1-5, 'recurrence': '...', 'tag': 'Work|Personal|Errand|Home|General', 'friendly_confirm': 'short acknowledgement only' }}"""
         return call_gemini(prompt)
-    except: return {"task": text, "deadline": (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d 09:00"), "priority": 3, "tag": "General", "friendly_confirm": "Alright, I've noted that down!"}
+    except: return {"task": text, "deadline": (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d 09:00"), "priority": 3, "tag": "General", "friendly_confirm": "Got it!"}
 
 def summarize_task_with_gemini(task):
     task_id, desc, details, deadline, priority, recurrence, tag, p_count = task
@@ -148,17 +152,15 @@ def reorder_tasks_with_gemini(tasks):
 def handle_smart_input_with_gemini(user_text, tasks, user_offset):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %A")
     task_context = "\n".join([f"ID {t[0]}: {t[1]} (Tag: {t[6]}, Due: {t[3]}, Moved: {t[7]})" for t in tasks])
-    prompt = f"""
-    Today is {now}. Tasks: {task_context}
-    User says: "{user_text}"
-    Vibe Guidelines:
-    - 6am-12pm: Motivate.
-    - 12pm-6pm: Focus.
-    - 6pm-10pm: Wind down.
-    - 10pm-6am: Sleep/Gentle.
-    Note: Ping user {user_offset} mins before deadlines. Assistant name: aidriel. Refer to tasks by their descriptions, not IDs.
-    Output JSON: {{ "type": "query|task|suggestion|delete|edit", "target_db_id": int, "answer": "vibe-aware response", "task_info": {{ ... }} }}
-    """
+    prompt = f"""Today is {now}. Tasks: {task_context}. Assistant aidriel. Warm vibe.
+    User says: "{user_text}". 
+    
+    CRITICAL INSTRUCTIONS:
+    1. If listing or referring to tasks, SUMMARIZE them into 5-7 words each. 
+    2. NEVER copy-paste the user's original long task descriptions in your 'answer' field.
+    3. If adding a new task, keep the 'answer' as a short, friendly acknowledgement only.
+    
+    Output JSON: {{ "type": "query|task|suggestion|delete|edit", "target_db_id": int, "answer": "your concise, summarized conversational response", "task_info": {{ ... }} }}"""
     return call_gemini(prompt)
 
 # ===== UI Helpers =====
@@ -178,13 +180,11 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
         tasks = get_pending_tasks(user_id)
         tasks_today = [t for t in tasks if t[3].startswith(today_str) or t[3] < today_str]
         if not tasks_today: continue
-        
         task_text = "\n".join([f"- {t[1]} (Tag: {t[6]}, Due: {t[3]})" for t in tasks_today])
         prompt = f"Provide a warm energetic morning briefing for these tasks:\n{task_text}"
         try: res = call_gemini(prompt); briefing = res.get("answer") if isinstance(res, dict) else str(res)
         except: briefing = "Good morning! Let's tackle today together."
-        
-        msg = f"🌅 *Morning Briefing*\n\n{briefing}\n\n📋 *Today's List:*\n\n"
+        msg = f"🌅 *Morning Briefing*\n\n{briefing}\n\n📋 *Your Day:*\n\n"
         keyboard = []
         for idx, t in enumerate(tasks_today, 1):
             msg += f"*{idx}.* {summarize_task_with_gemini(t)}\n"
@@ -226,12 +226,12 @@ def create_recurring_tasks():
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE); greeting = "Good morning" if 5 <= now.hour < 12 else "Good afternoon" if 12 <= now.hour < 18 else "Good evening"
-    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* I'll help you stay organized. Talk to me naturally or use /list!", parse_mode="Markdown")
+    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* Talk to me naturally or use /list!", parse_mode="Markdown")
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         offset = get_user_offset(update.message.from_user.id)
-        return await update.message.reply_text(f"I'll remind you **{offset} minutes** before a task. Change it: `/settings [mins]`", parse_mode="Markdown")
+        return await update.message.reply_text(f"I'll remind you **{offset} minutes** early. Change it: `/settings [mins]`", parse_mode="Markdown")
     try:
         new_offset = int(context.args[0]); set_user_offset(update.message.from_user.id, new_offset)
         await update.message.reply_text(f"Got it! I'll now ping you **{new_offset} minutes** early.", parse_mode="Markdown")
@@ -272,7 +272,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text, user_id = update.message.text, update.message.from_user.id
     tasks = get_pending_tasks(user_id); offset = get_user_offset(user_id)
     try:
-        res = handle_smart_input_with_gemini(user_text, tasks, offset); m_type = res.get("type")
+        res = handle_smart_input_with_gemini(user_text, tasks, offset)
+        m_type = res.get("type")
         if m_type == "query": await update.message.reply_text(f"🤖 {res.get('answer')}", parse_mode="Markdown")
         elif m_type == "suggestion": await update.message.reply_text(f"💡 {res.get('answer')}", parse_mode="Markdown")
         elif m_type in ["delete", "edit"] and res.get("target_db_id"):
@@ -296,20 +297,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     await application.bot.set_my_commands([BotCommand("start", "Help"), BotCommand("add", "Add task"), BotCommand("list", "Show tasks"), BotCommand("edit", "Edit task"), BotCommand("delete", "Delete task"), BotCommand("settings", "Timing")])
 
-# ===== Main =====
 if __name__ == '__main__':
-    # Fix Conflict: Wait 10 seconds to allow old instance to shutdown on Render
-    time.sleep(10)
-    
-    # Start Flask in a background thread for Render port health check
-    threading.Thread(target=run_flask, daemon=True).start()
-    
-    init_db()
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    time.sleep(10); threading.Thread(target=run_flask, daemon=True).start()
+    init_db(); app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     app.job_queue.run_repeating(check_reminders, interval=60, first=10)
     app.job_queue.run_daily(daily_digest, time=datetime.strptime("09:00", "%H:%M").time())
     scheduler = BackgroundScheduler(timezone=TIMEZONE); scheduler.add_job(create_recurring_tasks, 'cron', hour=0, minute=0); scheduler.start()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Fix Conflict: drop_pending_updates ensures we start fresh
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)); app.run_polling(drop_pending_updates=True)
