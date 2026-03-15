@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import calendar
 import time
+import threading
+from flask import Flask
 
 # ===== Config & Logging =====
 
@@ -28,6 +30,17 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent"
 TIMEZONE = pytz.timezone("Asia/Singapore")
+
+# ===== Render Port Workaround =====
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return "aidriel is online! 🚀"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host='0.0.0.0', port=port)
 
 # ===== Database =====
 DB_PATH = "tasks.db"
@@ -160,7 +173,7 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
         try: res = call_gemini(prompt); briefing = res.get("answer") if isinstance(res, dict) else str(res)
         except: briefing = "Good morning! Let's tackle today together."
         
-        msg = f"🌅 *Morning Briefing*\n\n{briefing}\n\n📋 *Today's List:*\n\n"
+        msg = f"🌅 *Morning Briefing*\n\n{briefing}\n\n📋 *Your Day:*\n\n"
         keyboard = []
         for idx, t in enumerate(tasks_today, 1):
             msg += f"*{idx}.* {summarize_task_with_gemini(t)}\n"
@@ -202,7 +215,7 @@ def create_recurring_tasks():
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE); greeting = "Good morning" if 5 <= now.hour < 12 else "Good afternoon" if 12 <= now.hour < 18 else "Good evening"
-    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* Talk to me naturally or use /list!", parse_mode="Markdown")
+    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* I'll help you stay organized. Talk to me naturally or use /list!", parse_mode="Markdown")
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -258,7 +271,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: i = res.get("task_info", {}); update_task(tid, i.get("task"), "", i.get("deadline"), i.get("priority"), i.get("recurrence"), i.get("tag"))
             await update.message.reply_text(f"✨ {res.get('answer')}", parse_mode="Markdown")
         elif m_type == "task":
-            i = res.get("task_info", {}); add_task(user_id, i.get("task") or user_text, "", i.get("deadline"), i.get("priority") or 3, i.get("recurrence"), i.get("tag") or "General")
+            i = res.get("task_info", {})
+            add_task(user_id, i.get("task") or user_text, "", i.get("deadline"), i.get("priority") or 3, i.get("recurrence"), i.get("tag") or "General")
             tag_str = f"🏷 `{i.get('tag')}` • " if i.get('tag') and i.get('tag') != "General" else ""
             await update.message.reply_text(f"✨ {res.get('answer')}\n\n📝 *{i.get('task') or user_text}*\n{tag_str}📅 `{i.get('deadline')}`", parse_mode="Markdown")
     except: await update.message.reply_text("Added to your list!")
@@ -272,9 +286,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     await application.bot.set_my_commands([BotCommand("start", "Help"), BotCommand("add", "Add task"), BotCommand("list", "Show tasks"), BotCommand("edit", "Edit task"), BotCommand("delete", "Delete task"), BotCommand("settings", "Timing")])
 
-init_db()
-app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-app.job_queue.run_repeating(check_reminders, interval=60, first=10)
-app.job_queue.run_daily(daily_digest, time=datetime.strptime("09:00", "%H:%M").time())
-scheduler = BackgroundScheduler(timezone=TIMEZONE); scheduler.add_job(create_recurring_tasks, 'cron', hour=0, minute=0); scheduler.start()
-app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)); app.run_polling()
+# ===== Main =====
+if __name__ == '__main__':
+    # Start Flask in a background thread
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.job_queue.run_repeating(check_reminders, interval=60, first=10)
+    app.job_queue.run_daily(daily_digest, time=datetime.strptime("09:00", "%H:%M").time())
+    scheduler = BackgroundScheduler(timezone=TIMEZONE); scheduler.add_job(create_recurring_tasks, 'cron', hour=0, minute=0); scheduler.start()
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)); app.run_polling()
