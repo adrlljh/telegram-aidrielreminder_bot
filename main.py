@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -173,6 +173,7 @@ def format_task_msg(description, deadline, priority, tag, custom_confirm=None):
 # ===== Background Jobs =====
 
 async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Triggering Daily Digest...")
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT DISTINCT user_id FROM tasks"); users = c.fetchall()
     today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
@@ -180,6 +181,7 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
         tasks = get_pending_tasks(user_id)
         tasks_today = [t for t in tasks if t[3].startswith(today_str) or t[3] < today_str]
         if not tasks_today: continue
+        
         task_text = "\n".join([f"- {t[1]} (Tag: {t[6]}, Due: {t[3]})" for t in tasks_today])
         prompt = f"Provide a warm energetic morning briefing for these tasks:\n{task_text}"
         try: res = call_gemini(prompt); briefing = res.get("answer") if isinstance(res, dict) else str(res)
@@ -295,12 +297,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("edit_"): await query.message.reply_text(f"Send me: `/edit ID [new info]`")
 
 async def post_init(application):
+    logger.info("Initializing Bot Commands...")
     await application.bot.set_my_commands([BotCommand("start", "Help"), BotCommand("add", "Add task"), BotCommand("list", "Show tasks"), BotCommand("edit", "Edit task"), BotCommand("delete", "Delete task"), BotCommand("settings", "Timing")])
 
 if __name__ == '__main__':
-    time.sleep(10); threading.Thread(target=run_flask, daemon=True).start()
-    init_db(); app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    app.job_queue.run_repeating(check_reminders, interval=60, first=10)
-    app.job_queue.run_daily(daily_digest, time=datetime.strptime("09:00", "%H:%M").time())
+    # Fix Conflict: Wait 10 seconds to allow old instance to shutdown on Render
+    time.sleep(10)
+    
+    # Start Flask in a background thread for Render port health check
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    
+    # Schedule Jobs
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_reminders, interval=60, first=10)
+    
+    # Explicit 9:00 AM Singapore Time
+    digest_time = dt_time(hour=9, minute=0, tzinfo=TIMEZONE)
+    job_queue.run_daily(daily_digest, time=digest_time)
+    logger.info(f"Daily digest scheduled for {digest_time}")
+    
     scheduler = BackgroundScheduler(timezone=TIMEZONE); scheduler.add_job(create_recurring_tasks, 'cron', hour=0, minute=0); scheduler.start()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)); app.run_polling(drop_pending_updates=True)
+    
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    app.run_polling(drop_pending_updates=True)
