@@ -108,18 +108,7 @@ def call_gemini(prompt, retries=3):
 def parse_task_with_gemini(text):
     try:
         now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %A")
-        prompt = f"""
-        Today is {now}.
-        Personality: Warm assistant named aidriel.
-        Vibe: 
-        - 6am-12pm: Energetic, planning-focused.
-        - 12pm-6pm: Steady, supportive.
-        - 6pm-10pm: Calming, winding down.
-        - 10pm-6am: Very gentle, suggesting rest.
-        
-        Extract task from: '{text}'. 
-        Output JSON: {{ 'task': '...', 'deadline': 'YYYY-MM-DD HH:MM', 'priority': 1-5, 'recurrence': '...', 'tag': 'Work|Personal|Errand|Home|General', 'friendly_confirm': 'short conversational confirmation reflecting the vibe' }}
-        """
+        prompt = f"Today is {now}. Extract task info from: '{text}'. Warm assistant named aidriel. Output JSON: {{ 'task': '...', 'deadline': 'YYYY-MM-DD HH:MM', 'priority': 1-5, 'recurrence': '...', 'tag': 'Work|Personal|Errand|Home|General', 'friendly_confirm': 'short conversational confirmation' }}"
         return call_gemini(prompt)
     except: return {"task": text, "deadline": (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d 09:00"), "priority": 3, "tag": "General", "friendly_confirm": "Alright, I've noted that down!"}
 
@@ -147,26 +136,13 @@ def handle_smart_input_with_gemini(user_text, tasks, user_offset):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %A")
     task_context = "\n".join([f"ID {t[0]}: {t[1]} (Tag: {t[6]}, Due: {t[3]}, Moved: {t[7]})" for t in tasks])
     prompt = f"""
-    Today is {now}. Assistant: aidriel.
-    Vibe Guidelines:
-    - 6am-12pm: Motivate the user for the day ahead.
-    - 12pm-6pm: Help the user stay focused and steady.
-    - 6pm-10pm: Help the user wind down; suggest rest if list is clear.
-    - 10pm-6am: Be very gentle; emphasize sleep and preparing for tomorrow.
-    
-    Tasks: {task_context}
+    Today is {now}. Tasks: {task_context}
     User says: "{user_text}"
-    
-    Output JSON: {{ "type": "query|task|suggestion|delete|edit", "target_db_id": int, "answer": "vibe-aware response without IDs", "task_info": {{ ... }} }}
+    Assistant: aidriel. Warm/Human/Vibe-Aware.
+    Note: Ping user {user_offset} mins before deadlines. Refer to tasks by their descriptions, not IDs.
+    Output JSON: {{ "type": "query|task|suggestion|delete|edit", "target_db_id": int, "answer": "conversational response without IDs", "task_info": {{ ... }} }}
     """
     return call_gemini(prompt)
-
-# ===== UI Helpers =====
-def format_priority(p): return ["", "High", "Medium", "Normal", "Low", "Very Low"][p] if 1 <= p <= 5 else "Normal"
-def format_task_msg(description, deadline, priority, tag, custom_confirm=None):
-    confirm = custom_confirm or "I've added that to your list!"
-    tag_str = f"🏷 `{tag}` • " if tag and tag != "General" else ""
-    return f"✨ {confirm}\n\n📝 *{description}*\n{tag_str}📅 `{deadline}`"
 
 # ===== Background Jobs =====
 
@@ -180,8 +156,7 @@ async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
         if not tasks_today: continue
         
         task_text = "\n".join([f"- {t[1]} (Tag: {t[6]}, Due: {t[3]})" for t in tasks_today])
-        now_time = datetime.now(TIMEZONE).strftime("%H:%M")
-        prompt = f"It's {now_time}. Provide a very warm, energetic morning briefing for these tasks:\n{task_text}"
+        prompt = f"Provide a warm energetic morning briefing for these tasks:\n{task_text}"
         try: res = call_gemini(prompt); briefing = res.get("answer") if isinstance(res, dict) else str(res)
         except: briefing = "Good morning! Let's tackle today together."
         
@@ -227,7 +202,7 @@ def create_recurring_tasks():
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE); greeting = "Good morning" if 5 <= now.hour < 12 else "Good afternoon" if 12 <= now.hour < 18 else "Good evening"
-    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* I'll help you stay organized. Talk to me naturally or use /list to see your plate!", parse_mode="Markdown")
+    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* Talk to me naturally or use /list!", parse_mode="Markdown")
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -242,12 +217,13 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     if not text: return await update.message.reply_text("What should I add?")
     parsed = parse_task_with_gemini(text); add_task(update.message.from_user.id, parsed.get("task") or text, "", parsed.get("deadline"), parsed.get("priority") or 3, parsed.get("recurrence"), parsed.get("tag") or "General")
-    await update.message.reply_text(format_task_msg(parsed.get("task") or text, parsed.get("deadline"), parsed.get("priority") or 3, parsed.get("tag") or "General", parsed.get("friendly_confirm")), parse_mode="Markdown")
+    tag_str = f"🏷 `{parsed.get('tag')}` • " if parsed.get('tag') and parsed.get('tag') != "General" else ""
+    await update.message.reply_text(f"✨ {parsed.get('friendly_confirm')}\n\n📝 *{parsed.get('task') or text}*\n{tag_str}📅 `{parsed.get('deadline')}`", parse_mode="Markdown")
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id; tasks = get_pending_tasks(user_id)
-    if not tasks: return await update.message.reply_text("🎉 *All caught up!*", parse_mode="Markdown")
-    tasks_ordered = reorder_tasks_with_gemini(tasks); msg = "📋 *Here's what's on your plate:*\n\n"; keyboard = []; id_map = {}
+    if not tasks: return await update.message.reply_text("🎉 *All caught up!*")
+    tasks_ordered = reorder_tasks_with_gemini(tasks); msg = "📋 *Your Tasks:*\n\n"; keyboard = []; id_map = {}
     for idx, t in enumerate(tasks_ordered, 1):
         id_map[idx] = t[0]; msg += f"*{idx}.* {summarize_task_with_gemini(t)}\n\n"
         keyboard.append([InlineKeyboardButton("✅ Done", callback_data=f"done_{t[0]}"), InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{t[0]}"), InlineKeyboardButton("🗑 Del", callback_data=f"del_{t[0]}")])
@@ -259,12 +235,12 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_id = int(context.args[0]); id_map = context.user_data.get('id_map', {}); db_id = id_map.get(display_id, display_id)
         desc = get_task_by_id(db_id); delete_task(db_id)
         await update.message.reply_text(f"Done! I've removed '{desc}' from your list.")
-    except: await update.message.reply_text("I couldn't find that task ID.")
+    except: await update.message.reply_text("I couldn't find that task.")
 
 async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2: return await update.message.reply_text("Usage: /edit 1 [new info]")
     try:
-        display_id = int(context.args[0]); new_text = " ".join(context.args[1:]); db_id = context.user_data.get('id_map', {}).get(display_id, display_id)
+        display_id = int(context.args[0]); new_text = " ".join(context.args[1:]); id_map = context.user_data.get('id_map', {}); db_id = id_map.get(display_id, display_id)
         parsed = parse_task_with_gemini(new_text); update_task(db_id, parsed.get("task") or new_text, "", parsed.get("deadline"), parsed.get("priority"), parsed.get("recurrence"), parsed.get("tag"))
         await update.message.reply_text(f"Got it! I've updated '{parsed.get('task') or new_text}'.")
     except: await update.message.reply_text("I couldn't update that task.")
@@ -285,7 +261,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             i = res.get("task_info", {}); add_task(user_id, i.get("task") or user_text, "", i.get("deadline"), i.get("priority") or 3, i.get("recurrence"), i.get("tag") or "General")
             tag_str = f"🏷 `{i.get('tag')}` • " if i.get('tag') and i.get('tag') != "General" else ""
             await update.message.reply_text(f"✨ {res.get('answer')}\n\n📝 *{i.get('task') or user_text}*\n{tag_str}📅 `{i.get('deadline')}`", parse_mode="Markdown")
-    except: await update.message.reply_text("No problem! Added that to your list.")
+    except: await update.message.reply_text("Added to your list!")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); db_id = int(query.data.split("_")[1])
@@ -294,7 +270,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("edit_"): await query.message.reply_text(f"Send me: `/edit ID [new info]`")
 
 async def post_init(application):
-    await application.bot.set_my_commands([BotCommand("start", "Help"), BotCommand("add", "Add task"), BotCommand("list", "Show tasks"), BotCommand("edit", "Edit task"), BotCommand("delete", "Delete task"), BotCommand("settings", "Reminder timing")])
+    await application.bot.set_my_commands([BotCommand("start", "Help"), BotCommand("add", "Add task"), BotCommand("list", "Show tasks"), BotCommand("edit", "Edit task"), BotCommand("delete", "Delete task"), BotCommand("settings", "Timing")])
 
 init_db()
 app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
