@@ -69,18 +69,52 @@ def get_task_by_id(db_id):
     return row[0] if row else "Unknown Task"
 
 def add_task(user_id, description, details, deadline, priority, recurrence=None, tag="General"):
+    # Force Priority 1 for life-critical keywords (REGEX matching)
+    critical_pattern = r"\b(surgery|hospital|doctor|er|urgent|critical|final deadline|deadline)\b"
+    if re.search(critical_pattern, description, re.IGNORECASE):
+        priority = 1
+        
+    # Auto-silence reminders for historical tasks
+    reminded = 0
+    if deadline:
+        try:
+            deadline_dt = datetime.strptime(deadline, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+            # If the task is already past, mark as reminded immediately
+            if datetime.now(TIMEZONE) >= deadline_dt: reminded = 1
+        except: pass
+
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("INSERT INTO tasks (user_id, description, details, deadline, priority, recurrence, reminded, tag, postpone_count) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0)", (user_id, description, details, deadline, priority, recurrence, tag))
+    c.execute("INSERT INTO tasks (user_id, description, details, deadline, priority, recurrence, reminded, tag, postpone_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)", (user_id, description, details, deadline, priority, recurrence, reminded, tag))
     conn.commit(); conn.close()
 
 def update_task(task_id, description, details, deadline, priority, recurrence, tag=None):
+    # Force Priority 1 for life-critical keywords (REGEX matching)
+    critical_pattern = r"\b(surgery|hospital|doctor|er|urgent|critical|final deadline|deadline)\b"
+    if re.search(critical_pattern, description, re.IGNORECASE):
+        priority = 1
+
+    # Auto-silence reminders for historical tasks
+    reminded = 0
+    if deadline:
+        try:
+            deadline_dt = datetime.strptime(deadline, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+            if datetime.now(TIMEZONE) >= deadline_dt: reminded = 1
+        except: pass
+
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT deadline FROM tasks WHERE id=?", (task_id,))
-    row = c.fetchone(); old_deadline = row[0] if row else None
-    postpone_inc = 1 if old_deadline and deadline > old_deadline else 0
-    if tag: c.execute("UPDATE tasks SET description=?, details=?, deadline=?, priority=?, recurrence=?, reminded=0, tag=?, postpone_count=postpone_count+? WHERE id=?", (description, details, deadline, priority, recurrence, tag, postpone_inc, task_id))
-    else: c.execute("UPDATE tasks SET description=?, details=?, deadline=?, priority=?, recurrence=?, reminded=0, postpone_count=postpone_count+? WHERE id=?", (description, details, deadline, priority, recurrence, postpone_inc, task_id))
+    c.execute("SELECT deadline, postpone_count FROM tasks WHERE id=?", (task_id,))
+    row = c.fetchone()
+    old_deadline = row[0] if row else None
+    old_postpone_count = row[1] if row else 0
+    
+    # Calculate postpone increment: only if new deadline is strictly later than old deadline
+    postpone_inc = 1 if old_deadline and deadline and str(deadline) > str(old_deadline) else 0
+    new_postpone_count = old_postpone_count + postpone_inc
+    
+    if tag: c.execute("UPDATE tasks SET description=?, details=?, deadline=?, priority=?, recurrence=?, reminded=?, tag=?, postpone_count=? WHERE id=?", (description, details, deadline, priority, recurrence, reminded, tag, new_postpone_count, task_id))
+    else: c.execute("UPDATE tasks SET description=?, details=?, deadline=?, priority=?, recurrence=?, reminded=?, postpone_count=? WHERE id=?", (description, details, deadline, priority, recurrence, reminded, new_postpone_count, task_id))
     conn.commit(); conn.close()
+    logger.info(f"Updated task {task_id}: {description} (P:{priority}, D:{deadline}, R:{reminded}, Postponed:{new_postpone_count})")
 
 def delete_task(task_id):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -121,22 +155,55 @@ def call_gemini(prompt, retries=3):
 def parse_task_with_gemini(text):
     try:
         now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %A")
-        prompt = f"""Today is {now}. Warm assistant aidriel. 
+        prompt = f"""Today is {now}. You are aidriel, a warm and supportive personal assistant.
         Extract task info from: '{text}'. 
-        CRITICAL: Do NOT repeat or summarize the task details in your 'friendly_confirm'. 
-        Give a short, natural acknowledgement ONLY (e.g., "Alright!", "Got it!", "On it!").
-        Output JSON: {{ 'task': '...', 'deadline': 'YYYY-MM-DD HH:MM', 'priority': 1-5, 'recurrence': '...', 'tag': 'Work|Personal|Errand|Home|General', 'friendly_confirm': 'short acknowledgement only' }}"""
+        
+        CRITICAL TASK RULES:
+        - If the user lists multiple items (e.g. "milk, eggs, and bread"), YOU MUST include ALL of them in the 'task' field. Do not truncate.
+        
+        CRITICAL DEADLINE RULES:
+        - If the user specifies a time or relative date (e.g., "1am tomorrow", "9pm tonight", "yesterday", "last Monday"), you MUST calculate the exact 'YYYY-MM-DD HH:MM' and put it in the 'deadline' field.
+        - If NO time is specified or implied, you MUST leave 'deadline' as null. Do NOT default to the current time.
+        - "Tonight" means today's date. "Tomorrow" means today's date + 1 day. "Yesterday" means today's date - 1 day.
+        
+        STRICT PRIORITY RULES:
+        - YOU MUST use Priority 1 (Red) for any life-critical, medical, or high-stakes items.
+        - For example: surgery, hospital visits, critical deadlines, or ER trips MUST be Priority 1. 
+        - If a task sounds like it has serious consequences if missed, set Priority to 1.
+        - Use Priority 3 (Normal) as the default.
+        
+        CRITICAL CONFIRMATION RULES:
+        - Do NOT repeat or summarize the task details in your 'friendly_confirm'. 
+        - Give a short, conversational acknowledgement as if you're speaking to a friend (e.g., "I'll take care of that!", "Added to your list.", "Got you covered!").
+        - Avoid being robotic.
+        
+        Output JSON: {{ 'task': '...', 'deadline': 'YYYY-MM-DD HH:MM', 'priority': 1-5, 'recurrence': 'daily'|'weekly'|'monthly', 'tag': 'Work|Personal|Errand|Home|Shopping|Health|Finance|Social|General', 'friendly_confirm': 'short natural response' }}"""
         return call_gemini(prompt)
-    except: return {"task": text, "deadline": (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d 09:00"), "priority": 3, "tag": "General", "friendly_confirm": "Got it!"}
+    except: return {"task": text, "deadline": (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d 09:00"), "priority": 3, "tag": "General", "friendly_confirm": "I've added that for you."}
 
 def summarize_task_with_gemini(task):
     task_id, desc, details, deadline, priority, recurrence, tag, p_count = task
-    p_emoji = ["", "🔴", "🟠", "🟡", "🟢", "⚪️"][priority] if 1 <= priority <= 5 else "🟡"
-    shadow_msg = " 🫣" if p_count > 0 else ""
+    # Handle priority as None
+    safe_priority = priority if priority is not None else 3
+    
+    # Human-like priority correction (Using whole-word regex to avoid "grocery" matching "er")
+    critical_pattern = r"\b(surgery|hospital|doctor|er|urgent|critical|final deadline|deadline)\b"
+    is_critical = bool(re.search(critical_pattern, desc, re.IGNORECASE))
+    
+    if is_critical:
+        safe_priority = 1
+        
+    # Shadow emoji logic
+    shadow_msg = ""
+    if p_count is not None and p_count > 0:
+        shadow_msg = " 🫣"
+
+    p_emoji = ["", "🔴", "🟠", "🟡", "🟢", "⚪️"][safe_priority] if 1 <= safe_priority <= 5 else "🟡"
     return f"{p_emoji} `[{tag}]` *{desc}*{shadow_msg} \n   📅 `{deadline}`"
 
 def reorder_tasks_with_gemini(tasks):
-    base_sorted = sorted(tasks, key=lambda x: (x[4], x[3]))
+    # Handle None values in priority (index 4) or deadline (index 3) to prevent TypeError
+    base_sorted = sorted(tasks, key=lambda x: (x[4] if x[4] is not None else 3, x[3] if x[3] is not None else "9999-12-31 23:59"))
     try:
         task_text = "\n".join([f"- {t[0]}: {t[1]} (Tag: {t[6]}, Due: {t[3]}, Priority: {t[4]}, Moved: {t[7]})" for t in tasks])
         prompt = f"Reorder these task IDs by Priority then Deadline. Output JSON array of IDs. \n{task_text}"
@@ -152,67 +219,150 @@ def reorder_tasks_with_gemini(tasks):
 def handle_smart_input_with_gemini(user_text, tasks, user_offset):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M %A")
     task_context = "\n".join([f"ID {t[0]}: {t[1]} (Tag: {t[6]}, Due: {t[3]}, Moved: {t[7]})" for t in tasks])
-    prompt = f"""Today is {now}. Tasks: {task_context}. Assistant aidriel. Warm vibe.
+    prompt = f"""Today is {now}. Tasks: {task_context}. You are aidriel, a warm and empathetic assistant.
     User says: "{user_text}". 
     
-    CRITICAL INSTRUCTIONS:
-    1. If listing or referring to tasks, SUMMARIZE them into 5-7 words each. 
-    2. NEVER copy-paste the user's original long task descriptions in your 'answer' field.
-    3. If adding a new task, keep the 'answer' as a short, friendly acknowledgement only.
+    INTENT DETECTION RULES (STRICT):
+    1. LISTING: If the user wants to see their pending tasks (e.g., "what's on my list?", "show my tasks"), return {{"type": "query", "answer": "list_tasks"}}.
+    2. TASK DETECTION (PRIORITY): If the input describes a new future action, appointment, or deadline (e.g., "surgery tomorrow at 8am", "call the bank"), return {{"type": "task", ...}}. THIS TAKES PRECEDENCE OVER EMOTION.
+    3. EMOTION/SUPPORT: If the user expresses purely feelings (e.g., "I'm overwhelmed", "I'm tired") WITHOUT any mention of a task or action, return {{"type": "query", "answer": "a warm, empathetic supportive response under 15 words"}}.
+    4. DELETING/EDITING: If target name/ID matches context AND the user clearly wants to remove or change that specific existing task, return {{"type": "delete"|"edit", "target_db_id": ...}}. 
+    5. DISCARDING INPUT: If the user says "discard" or "cancel" without specifying an existing task from the list, they likely mean to cancel the action they are currently in (like historical confirmation). Return {{"type": "query", "answer": "Action cancelled."}}.
+    6. QUERY: General bot questions or small talk.
     
-    Output JSON: {{ "type": "query|task|suggestion|delete|edit", "target_db_id": int, "answer": "your concise, summarized conversational response", "task_info": {{ ... }} }}"""
+    CRITICAL CONSTRAINTS:
+    - If user adds/edits a task with a time (e.g. "1am tomorrow"), you MUST calculate the exact 'YYYY-MM-DD HH:MM' for 'deadline' in 'task_info'.
+    - If NO time is specified for a new task, 'deadline' MUST be null.
+    - NEVER repeat the user's full input in the 'answer'.
+    - Keep 'answer' conversational and human-like, not like a machine.
+    - Keep 'answer' under 15 words.
+    
+        Output JSON: {{ "type": "query|task|suggestion|delete|edit", "target_db_id": int, "answer": "list_tasks or a friendly, natural response", "task_info": {{ "task": "...", "deadline": "YYYY-MM-DD HH:MM", "recurrence": "daily|weekly|monthly", "tag": "Work|Personal|Errand|Home|Shopping|Health|Finance|Social|General", ... }} }}"""
     return call_gemini(prompt)
 
 # ===== UI Helpers =====
 def format_priority(p): return ["", "High", "Medium", "Normal", "Low", "Very Low"][p] if 1 <= p <= 5 else "Normal"
 def format_task_msg(description, deadline, priority, tag, custom_confirm=None):
-    confirm = custom_confirm or "I've added that to your list!"
+    confirm = custom_confirm or "I've added that for you."
     tag_str = f"🏷 `{tag}` • " if tag and tag != "General" else ""
-    return f"✨ {confirm}\n\n📝 *{description}*\n{tag_str}📅 `{deadline}`"
+    deadline_str = f"📅 `{deadline}`" if deadline else "📅 `No deadline set`"
+    return f"{confirm}\n\n📝 *{description}*\n{tag_str}{deadline_str}"
 
 # ===== Background Jobs =====
 
-async def daily_digest(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Triggering Daily Digest...")
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT DISTINCT user_id FROM tasks"); users = c.fetchall()
-    today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+async def daily_digest(context: ContextTypes.DEFAULT_TYPE, target_user_id=None):
+    logger.info(f"Triggering Daily Digest (Target: {target_user_id})...")
+    try:
+        if target_user_id:
+            users = [(target_user_id,)]
+        else:
+            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            c.execute("SELECT DISTINCT user_id FROM tasks"); users = c.fetchall()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching users for digest: {e}")
+        return
+
+    now_dt = datetime.now(TIMEZONE)
+    today_str = now_dt.strftime("%Y-%m-%d")
+    tomorrow_str = (now_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    
     for (user_id,) in users:
-        tasks = get_pending_tasks(user_id)
-        tasks_today = [t for t in tasks if t[3].startswith(today_str) or t[3] < today_str]
-        if not tasks_today: continue
-        
-        task_text = "\n".join([f"- {t[1]} (Tag: {t[6]}, Due: {t[3]})" for t in tasks_today])
-        prompt = f"Provide a warm energetic morning briefing for these tasks:\n{task_text}"
-        try: res = call_gemini(prompt); briefing = res.get("answer") if isinstance(res, dict) else str(res)
-        except: briefing = "Good morning! Let's tackle today together."
-        msg = f"🌅 *Morning Briefing*\n\n{briefing}\n\n📋 *Your Day:*\n\n"
-        keyboard = []
-        for idx, t in enumerate(tasks_today, 1):
-            msg += f"*{idx}.* {summarize_task_with_gemini(t)}\n"
-            keyboard.append([InlineKeyboardButton(f"✅ Done #{idx}", callback_data=f"done_{t[0]}")])
-        try: await context.bot.send_message(user_id, msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-        except: pass
-    conn.close()
+        try:
+            tasks = get_pending_tasks(user_id)
+            # Filter for tasks due today (startswith today_str) or overdue (strictly less than today_str AND not today)
+            # Use 'sorted' consistency: priority then deadline
+            tasks_today = [t for t in tasks if t[3] and (t[3][:10] <= today_str)]
+            # Sort them so they show up correctly in the digest
+            tasks_today = sorted(tasks_today, key=lambda x: (x[4] if x[4] is not None else 3, x[3]))
+
+            # Also fetch high priority tasks coming up tomorrow
+            tasks_tomorrow_high = [t for t in tasks if t[3] and t[3].startswith(tomorrow_str) and t[4] is not None and t[4] <= 2]
+
+            # In TEST mode, if we have no tasks today but have some tomorrow, let's show them in the digest
+            # This makes testing easier when you add something for "tomorrow" and immediately run /test_digest
+            tasks_to_show = tasks_today + (tasks_tomorrow_high if context.user_data and context.user_data.get('is_test') else [])
+
+            if not tasks_to_show:
+                logger.info(f"No tasks for user {user_id} today.")
+                # Only send the "no tasks" message if specifically requested via test command
+                if context.user_data and context.user_data.get('is_test'):
+                    await context.bot.send_message(user_id, "🌅 *Morning Briefing*\n\nYou have no pending tasks for today! Enjoy your day. ✨", parse_mode="Markdown")
+                continue
+
+            task_list_text = [f"- {t[1]} (Tag: {t[6]}, Due: {t[3]})" for t in tasks_today]
+            if tasks_tomorrow_high:
+                task_list_text.append("\nUpcoming tomorrow (High Priority):")
+                task_list_text.extend([f"- {t[1]} (Tag: {t[6]}, Due: {t[3]})" for t in tasks_tomorrow_high])
+            
+            task_text = "\n".join(task_list_text)
+            prompt = f"You are aidriel, a warm and energetic personal assistant. Provide a short, enthusiastic morning briefing for these tasks. Be empathetic and encouraging. If there are high priority items tomorrow, give a brief heads up. Keep it under 3 sentences:\n{task_text}"
+            briefing = "Good morning! I've looked at your schedule, and it looks like we have a productive day ahead. Let's tackle it together!"
+            try:
+                res = call_gemini(prompt)
+                if isinstance(res, dict) and res.get("answer"): briefing = res.get("answer")
+                elif isinstance(res, str): briefing = res
+            except Exception as e:
+                logger.warning(f"Gemini briefing failed for {user_id}: {e}")
+
+            msg = f"🌅 *Morning Briefing*\n\n{briefing}\n\n📋 *Your Day:*\n\n"
+            keyboard = []
+            for idx, t in enumerate(tasks_to_show, 1):
+                msg += f"*{idx}.* {summarize_task_with_gemini(t)}\n"
+                keyboard.append([InlineKeyboardButton(f"✅ Done #{idx}", callback_data=f"done_{t[0]}")])
+
+            await context.bot.send_message(user_id, msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+            logger.info(f"Sent digest to {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to send digest to {user_id}: {e}")
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    # Fetch tasks that haven't been reminded yet
     c.execute("SELECT id, user_id, description, deadline FROM tasks WHERE status='pending' AND reminded=0")
     all_pending = c.fetchall(); now = datetime.now(TIMEZONE)
+    
+    if all_pending:
+        logger.info(f"REMINDER LOOP: Checking {len(all_pending)} tasks at {now.strftime('%H:%M:%S')}")
+
     for tid, uid, desc, dl in all_pending:
         try:
-            offset = get_user_offset(uid); deadline_dt = datetime.strptime(dl, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
-            if now >= (deadline_dt - timedelta(minutes=offset)):
-                await context.bot.send_message(uid, f"⏰ *Just a heads up!* \n'{desc}' is due soon.", parse_mode="Markdown")
+            if not dl: continue
+            # Ensure proper parsing of the deadline string
+            try:
+                deadline_dt = datetime.strptime(dl, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+            except ValueError:
+                # Handle cases like "2026-03-16" without time
+                deadline_dt = datetime.strptime(dl, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                
+            offset = get_user_offset(uid)
+            
+            # 1. Silently mark as reminded if it's already past the deadline.
+            if now >= deadline_dt:
                 c.execute("UPDATE tasks SET reminded=1 WHERE id=?", (tid,))
-        except: pass
+                continue
+                
+            # 2. Only send if we are within the notification window AND before the deadline.
+            if now >= (deadline_dt - timedelta(minutes=offset)) and now < deadline_dt:
+                import random
+                intro = random.choice(["Just a quick reminder that", "Hey, just letting you know that", "Thought I'd remind you that", "Friendly heads up:"])
+                await context.bot.send_message(uid, f"⏰ {intro} '{desc}' is due soon.", parse_mode="Markdown")
+                c.execute("UPDATE tasks SET reminded=1 WHERE id=?", (tid,))
+        except Exception as e:
+            logger.error(f"Error in reminder loop for ID {tid}: {e}")
     conn.commit(); conn.close()
 
 def create_recurring_tasks():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT user_id, description, details, deadline, priority, recurrence, tag FROM tasks WHERE recurrence IS NOT NULL AND status='done'")
-    for uid, desc, det, dl, pri, rec, tag in c.fetchall():
+    c.execute("SELECT id, user_id, description, details, deadline, priority, recurrence, tag FROM tasks WHERE recurrence IS NOT NULL AND status='done'")
+    rows = c.fetchall()
+    for tid, uid, desc, det, dl, pri, rec, tag in rows:
         try:
+            # If no deadline, default to today 9am to calculate next
+            if not dl: dl = datetime.now(TIMEZONE).strftime("%Y-%m-%d 09:00")
+            
+            # Handle cases where deadline might be just date
+            if len(dl) == 10: dl += " 09:00"
             nxt = datetime.strptime(dl, "%Y-%m-%d %H:%M")
             if rec == "daily": nxt += timedelta(days=1)
             elif rec == "weekly": nxt += timedelta(weeks=1)
@@ -221,21 +371,45 @@ def create_recurring_tasks():
                 y = nxt.year + (1 if nxt.month == 12 else 0)
                 nxt = nxt.replace(year=y, month=m)
             add_task(uid, desc, det, nxt.strftime("%Y-%m-%d %H:%M"), pri, rec, tag)
-            c.execute("UPDATE tasks SET recurrence=NULL WHERE deadline=? AND description=? AND status='done'", (dl, desc))
-        except: pass
+            c.execute("UPDATE tasks SET recurrence=NULL WHERE id=?", (tid,))
+        except Exception as e:
+            logger.error(f"Error creating recurring task for ID {tid}: {e}")
     conn.commit(); conn.close()
 
 # ===== Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE); greeting = "Good morning" if 5 <= now.hour < 12 else "Good afternoon" if 12 <= now.hour < 18 else "Good evening"
-    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* Talk to me naturally or use /list!", parse_mode="Markdown")
+    await update.message.reply_text(f"👋 *{greeting}! I'm aidriel.* I'm here to help you stay organized. Feel free to talk to me naturally, or use /list to see what's on your plate!", parse_mode="Markdown")
+
+async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TIMEZONE)
+    await update.message.reply_text(f"🕒 My current time is `{now.strftime('%Y-%m-%d %H:%M:%S %Z')}`", parse_mode="Markdown")
+
+async def test_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    await update.message.reply_text("Triggering test digest for you...")
+    
+    # Mock context to run digest
+    class MockContext:
+        def __init__(self, bot, user_data):
+            self.bot = bot
+            self.user_data = user_data
+
+    # Temporarily mark as test to get feedback even if 0 tasks
+    context.user_data['is_test'] = True
+    # Pass user_id to isolate the digest
+    await daily_digest(MockContext(context.bot, context.user_data), target_user_id=user_id)
+    context.user_data['is_test'] = False
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         offset = get_user_offset(update.message.from_user.id)
         return await update.message.reply_text(f"I'll remind you **{offset} minutes** early. Change it: `/settings [mins]`", parse_mode="Markdown")
     try:
-        new_offset = int(context.args[0]); set_user_offset(update.message.from_user.id, new_offset)
+        new_offset = int(context.args[0])
+        if new_offset < 0:
+            return await update.message.reply_text("The reminder offset cannot be negative. Try `/settings 0` for reminders at the exact time.")
+        set_user_offset(update.message.from_user.id, new_offset)
         await update.message.reply_text(f"Got it! I'll now ping you **{new_offset} minutes** early.", parse_mode="Markdown")
     except: await update.message.reply_text("Usage: `/settings 60`")
 
@@ -255,46 +429,135 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['id_map'] = id_map; await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.message.reply_text("Which task? (e.g. /delete 1)")
+    if not context.args: return await update.message.reply_text("Which task would you like me to remove? (e.g. /delete 1)")
     try:
         display_id = int(context.args[0]); id_map = context.user_data.get('id_map', {}); db_id = id_map.get(display_id, display_id)
         desc = get_task_by_id(db_id); delete_task(db_id)
-        await update.message.reply_text(f"Done! I've removed '{desc}' from your list.")
-    except: await update.message.reply_text("I couldn't find that task.")
+        await update.message.reply_text(f"Got it. I've removed '{desc}' from your list.")
+    except: await update.message.reply_text("I'm sorry, I couldn't find that task. Could you double-check the ID?")
 
 async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2: return await update.message.reply_text("Usage: /edit 1 [new info]")
+    if len(context.args) < 2: return await update.message.reply_text("How would you like to update it? (e.g., /edit 1 buy groceries tomorrow)")
     try:
         display_id = int(context.args[0]); new_text = " ".join(context.args[1:]); id_map = context.user_data.get('id_map', {}); db_id = id_map.get(display_id, display_id)
         parsed = parse_task_with_gemini(new_text); update_task(db_id, parsed.get("task") or new_text, "", parsed.get("deadline"), parsed.get("priority"), parsed.get("recurrence"), parsed.get("tag"))
-        await update.message.reply_text(f"Got it! I've updated '{parsed.get('task') or new_text}'.")
-    except: await update.message.reply_text("I couldn't update that task.")
+        await update.message.reply_text(f"All set! I've updated '{parsed.get('task') or new_text}' for you.")
+    except: await update.message.reply_text("I had a bit of trouble updating that task. Could you try again?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text, user_id = update.message.text, update.message.from_user.id
     tasks = get_pending_tasks(user_id); offset = get_user_offset(user_id)
+
+    # Handle confirmation for historical tasks
+    if context.user_data.get('awaiting_historical_confirm'):
+        pending = context.user_data['awaiting_historical_confirm']
+        user_text_low = user_text.lower()
+        if "yes" in user_text_low or "add" in user_text_low or "ok" in user_text_low:
+            add_task(user_id, pending['task'], "", pending['deadline'], pending['priority'], pending['recurrence'], pending['tag'])
+            context.user_data.pop('awaiting_historical_confirm')
+            return await update.message.reply_text("Done! I've added it to your list anyway.")
+        elif "no" in user_text_low or "cancel" in user_text_low or "discard" in user_text_low:
+            context.user_data.pop('awaiting_historical_confirm')
+            return await update.message.reply_text("No problem, I've discarded that. What else can I help with?")
+        
+        # If they are correcting the time (e.g., "i mean tomorrow"), we merge the context
+        context.user_data.pop('awaiting_historical_confirm')
+        user_text = f"Add task: {pending['task']} {user_text}"
+        logger.info(f"Historical Correction: Merged text to '{user_text}'")
+
     try:
         res = handle_smart_input_with_gemini(user_text, tasks, offset)
+        if not res: raise Exception("Empty AI response")
         m_type = res.get("type")
-        if m_type == "query": await update.message.reply_text(f"🤖 {res.get('answer')}", parse_mode="Markdown")
-        elif m_type == "suggestion": await update.message.reply_text(f"💡 {res.get('answer')}", parse_mode="Markdown")
+
+        # Intent: List Tasks (AI-Driven + Catch-all safety)
+        ai_answer = str(res.get("answer", "")).strip().lower()
+        is_list_intent = "list" in ai_answer or "pending" in ai_answer or "show" in ai_answer or "tasks" in ai_answer or "items" in ai_answer
+        if m_type == "query" and is_list_intent:
+            return await list_tasks(update, context)
+
+        if m_type == "query": await update.message.reply_text(res.get('answer'), parse_mode="Markdown")
+        elif m_type == "suggestion": await update.message.reply_text(res.get('answer'), parse_mode="Markdown")
         elif m_type in ["delete", "edit"] and res.get("target_db_id"):
             tid = res["target_db_id"]
             if m_type == "delete": delete_task(tid)
-            else: i = res.get("task_info", {}); update_task(tid, i.get("task"), "", i.get("deadline"), i.get("priority"), i.get("recurrence"), i.get("tag"))
-            await update.message.reply_text(f"✨ {res.get('answer')}", parse_mode="Markdown")
+            else:
+                # To prevent data loss during AI updates, fetch current task data first
+                conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+                c.execute("SELECT description, details, deadline, priority, recurrence, tag FROM tasks WHERE id=?", (tid,))
+                current = c.fetchone(); conn.close()
+                if not current: raise Exception(f"Task {tid} not found")
+                
+                i = res.get("task_info", {})
+                # Use updated value if provided by AI, otherwise keep current value
+                new_desc = i.get("task") or current[0]
+                new_details = i.get("details") or current[1]
+                new_deadline = i.get("deadline") or current[2]
+                new_priority = i.get("priority") if i.get("priority") is not None else current[3]
+                new_recurrence = i.get("recurrence") or current[4]
+                new_tag = i.get("tag") or current[5]
+                
+                update_task(tid, new_desc, new_details, new_deadline, new_priority, new_recurrence, new_tag)
+            await update.message.reply_text(res.get('answer'), parse_mode="Markdown")
         elif m_type == "task":
             i = res.get("task_info", {})
-            add_task(user_id, i.get("task") or user_text, "", i.get("deadline"), i.get("priority") or 3, i.get("recurrence"), i.get("tag") or "General")
-            tag_str = f"🏷 `{i.get('tag')}` • " if i.get('tag') and i.get('tag') != "General" else ""
-            await update.message.reply_text(f"✨ {res.get('answer')}\n\n📝 *{i.get('task') or user_text}*\n{tag_str}📅 `{i.get('deadline')}`", parse_mode="Markdown")
-    except: await update.message.reply_text("Added to your list!")
+            deadline = i.get("deadline")
+            desc = i.get("task") or user_text
+            tag = i.get("tag") or "General"
+            priority = i.get("priority") or 3
+            recurrence = i.get("recurrence")
+            
+            # Historical Warning & Confirmation Flow
+            is_past = False
+            if deadline:
+                try:
+                    now = datetime.now(TIMEZONE)
+                    dl_clean = str(deadline).strip()
+                    if len(dl_clean) == 10:
+                        deadline_dt = datetime.strptime(dl_clean, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                        if now.date() > deadline_dt.date(): is_past = True
+                    else:
+                        deadline_dt = datetime.strptime(dl_clean, "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+                        if now >= deadline_dt: is_past = True
+                except: pass
+
+            if is_past:
+                context.user_data['awaiting_historical_confirm'] = {'task': desc, 'deadline': deadline, 'priority': priority, 'recurrence': recurrence, 'tag': tag}
+                return await update.message.reply_text(f"Hold on, I noticed `{deadline}` has already passed. Did you still want me to add this task, or did you mean a different time?", parse_mode="Markdown")
+
+            add_task(user_id, desc, "", deadline, priority, recurrence, tag)
+            tag_str = f"🏷 `{tag}` • " if tag and tag != "General" else ""
+            deadline_str = f"📅 `{deadline}`" if deadline else "📅 `No deadline set`"
+            await update.message.reply_text(f"{res.get('answer')}\n\n📝 *{desc}*\n{tag_str}{deadline_str}", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Handle message failed: {e}")
+        # Default fallback: add as task if it doesn't look like a question
+        if "?" not in user_text:
+            parsed = parse_task_with_gemini(user_text)
+            add_task(user_id, parsed.get("task") or user_text, "", parsed.get("deadline"), parsed.get("priority") or 3, parsed.get("recurrence"), parsed.get("tag") or "General")
+            
+            # Check for recurring tasks immediately if the fallback add_task has a recurrence
+            if parsed.get("recurrence"):
+                create_recurring_tasks()
+
+            await update.message.reply_text(format_task_msg(parsed.get("task") or user_text, parsed.get("deadline"), parsed.get("priority") or 3, parsed.get("tag") or "General", parsed.get("friendly_confirm")), parse_mode="Markdown")
+        else:
+            await update.message.reply_text("I'm not sure how to help with that. Try /list or ask me something else!")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); db_id = int(query.data.split("_")[1])
-    if query.data.startswith("done_"): mark_done(db_id); await query.edit_message_text("✅ Great job!")
-    elif query.data.startswith("del_"): delete_task(db_id); await query.edit_message_text("🗑 Removed.")
-    elif query.data.startswith("edit_"): await query.message.reply_text(f"Send me: `/edit ID [new info]`")
+    if query.data.startswith("done_"): 
+        mark_done(db_id)
+        # Check for recurring tasks immediately
+        create_recurring_tasks()
+        import random
+        feedback = random.choice(["Great job getting that done!", "Nice work!", "One less thing to worry about!", "All set!", "Checked that off for you!"])
+        await query.edit_message_text(f"✅ {feedback}")
+    elif query.data.startswith("del_"): 
+        delete_task(db_id)
+        await query.edit_message_text("🗑 Removed that from your list.")
+    elif query.data.startswith("edit_"): 
+        await query.message.reply_text("Just let me know what needs to change: `/edit ID [new info]`")
 
 async def post_init(application):
     logger.info("Initializing Bot Commands...")
@@ -321,6 +584,6 @@ if __name__ == '__main__':
     
     scheduler = BackgroundScheduler(timezone=TIMEZONE); scheduler.add_job(create_recurring_tasks, 'cron', hour=0, minute=0); scheduler.start()
     
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("time", get_time)); app.add_handler(CommandHandler("add", add)); app.add_handler(CommandHandler("list", list_tasks)); app.add_handler(CommandHandler("tasks", list_tasks)); app.add_handler(CommandHandler("edit", edit)); app.add_handler(CommandHandler("delete", delete)); app.add_handler(CommandHandler("settings", settings)); app.add_handler(CommandHandler("test_digest", test_digest)); app.add_handler(CallbackQueryHandler(button_handler)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     app.run_polling(drop_pending_updates=True)
